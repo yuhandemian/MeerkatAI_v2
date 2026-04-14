@@ -1,0 +1,482 @@
+package com.capstone.meerkatai.chatbot.service;
+
+import com.google.cloud.dialogflow.v2.QueryResult;
+import com.capstone.meerkatai.chatbot.dto.ChatbotResponse;
+import org.springframework.stereotype.Service;
+import com.google.protobuf.Struct;
+import com.google.protobuf.Value;
+import com.capstone.meerkatai.anomalybehavior.service.AnomalyBehaviorService;
+import com.capstone.meerkatai.anomalybehavior.entity.AnomalyBehavior;
+import com.capstone.meerkatai.chatbot.dto.AnomalyTrendResponse;
+import com.capstone.meerkatai.chatbot.dto.CctvListResponse;
+import com.capstone.meerkatai.chatbot.dto.StorageInfoResponse;
+import com.capstone.meerkatai.chatbot.dto.DashboardSummaryResponse;
+import com.capstone.meerkatai.chatbot.dto.RecentVideosResponse;
+import com.capstone.meerkatai.cctv.service.CctvService;
+import com.capstone.meerkatai.storagespace.service.StorageSpaceService;
+import com.capstone.meerkatai.dashboard.service.DashboardService;
+import com.capstone.meerkatai.video.service.VideoService;
+import com.capstone.meerkatai.user.service.UserService;
+import com.capstone.meerkatai.user.entity.User;
+import com.capstone.meerkatai.user.repository.UserRepository;
+import org.springframework.security.core.Authentication;
+import org.springframework.security.core.context.SecurityContextHolder;
+import lombok.extern.slf4j.Slf4j;
+
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeParseException;
+import java.util.List;
+import java.util.Map;
+import java.util.stream.Collectors;
+
+@Slf4j
+@Service
+public class ChatbotService {
+
+    private final DialogflowService dialogflowService;
+    private final AnomalyBehaviorService anomalyBehaviorService;
+    private final CctvService cctvService;
+    private final StorageSpaceService storageSpaceService;
+    private final DashboardService dashboardService;
+    private final VideoService videoService;
+    private final UserService userService;
+    private final UserRepository userRepository;
+
+    public ChatbotService(DialogflowService dialogflowService,
+                          AnomalyBehaviorService anomalyBehaviorService,
+                          CctvService cctvService,
+                          StorageSpaceService storageSpaceService,
+                          DashboardService dashboardService,
+                          VideoService videoService,
+                          UserService userService,
+                          UserRepository userRepository) {
+        this.dialogflowService = dialogflowService;
+        this.anomalyBehaviorService = anomalyBehaviorService;
+        this.cctvService = cctvService;
+        this.storageSpaceService = storageSpaceService;
+        this.dashboardService = dashboardService;
+        this.videoService = videoService;
+        this.userService = userService;
+        this.userRepository = userRepository;
+    }
+
+    public ChatbotResponse processMessage(String message) {
+        try {
+            log.info("챗봇 메시지 처리 시작: {}", message);
+            
+            QueryResult queryResult = dialogflowService.detectIntent(message);
+            String intentDisplayName = queryResult.getIntent().getDisplayName();
+            String fulfillmentText = queryResult.getFulfillmentText();
+            Struct parameters = queryResult.getParameters();
+
+            log.info("Dialogflow Intent 감지: {} - {}", intentDisplayName, fulfillmentText);
+
+            ChatbotResponse response = new ChatbotResponse();
+
+            // Get current user ID from SecurityContextHolder
+            Authentication authentication = SecurityContextHolder.getContext().getAuthentication();
+            String email = authentication.getName();
+            
+            User currentUser = userRepository.findByEmail(email)
+                    .orElseThrow(() -> new RuntimeException("사용자를 찾을 수 없습니다: " + email));
+            Long currentUserId = currentUser.getUserId();
+            
+            log.info("사용자 인증 완료: userId={}, email={}", currentUserId, email);
+
+        switch (intentDisplayName) {
+            case "Default_Welcome_Intent":
+                response.setReply(fulfillmentText);
+                break;
+            case "Search_Anomaly_Events":
+                String cctvName = parameters.getFieldsOrDefault("cctv_name", Value.newBuilder().setStringValue("").build()).getStringValue();
+                String anomalyType = parameters.getFieldsOrDefault("anomaly_type", Value.newBuilder().setStringValue("").build()).getStringValue();
+                String date = parameters.getFieldsOrDefault("date", Value.newBuilder().setStringValue("").build()).getStringValue();
+                String datePeriod = parameters.getFieldsOrDefault("date-period", Value.newBuilder().setStringValue("").build()).getStringValue();
+
+                LocalDateTime startDate = null;
+                LocalDateTime endDate = null;
+
+                if (!date.isEmpty()) {
+                    try {
+                        startDate = LocalDate.parse(date).atStartOfDay();
+                        endDate = LocalDate.parse(date).plusDays(1).atStartOfDay(); // End of the day
+                    } catch (DateTimeParseException e) {
+                        // Handle parsing error, maybe log or return a specific message
+                    }
+                } else if (!datePeriod.isEmpty()) {
+                    // Dialogflow's date-period can be "YYYY-MM-DD/YYYY-MM-DD"
+                    String[] dates = datePeriod.split("/");
+                    if (dates.length == 2) {
+                        try {
+                            startDate = LocalDate.parse(dates[0]).atStartOfDay();
+                            endDate = LocalDate.parse(dates[1]).plusDays(1).atStartOfDay();
+                        } catch (DateTimeParseException e) {
+                            // Handle parsing error
+                        }
+                    }
+                }
+
+                // Call AnomalyBehaviorService to get actual data
+                List<AnomalyBehavior> events = anomalyBehaviorService.searchAnomalyEvents(currentUserId, cctvName, anomalyType, startDate, endDate);
+
+                StringBuilder replyBuilder = new StringBuilder();
+                if (events.isEmpty()) {
+                    replyBuilder.append("검색 조건에 맞는 이상 행동이 없습니다. ");
+                } else {
+                    replyBuilder.append("총 ").append(events.size()).append("건의 이상 행동을 찾았습니다:\n\n");
+                    
+                    for (int i = 0; i < Math.min(events.size(), 5); i++) { // 최대 5개만 표시
+                        AnomalyBehavior event = events.get(i);
+                        replyBuilder.append("• ").append(event.getAnomalyBehaviorType())
+                                .append(" - ").append(event.getAnomalyTime().toLocalDate())
+                                .append(" ").append(event.getAnomalyTime().toLocalTime().toString().substring(0, 5));
+                        
+                        if (event.getStreamingVideo() != null && event.getStreamingVideo().getCctv() != null) {
+                            replyBuilder.append(" (").append(event.getStreamingVideo().getCctv().getCctvName()).append(")");
+                        }
+                        replyBuilder.append("\n\n");
+                    }
+                    
+                    if (events.size() > 5) {
+                        replyBuilder.append("\n\n... 외 ").append(events.size() - 5).append("건 더 있습니다.");
+                    }
+                }
+                
+                // Add search criteria info
+                replyBuilder.append("\n\n검색 조건: ");
+                if (!cctvName.isEmpty()) replyBuilder.append("CCTV=").append(cctvName).append(", ");
+                if (!anomalyType.isEmpty()) replyBuilder.append("유형=").append(anomalyType).append(", ");
+                if (startDate != null) replyBuilder.append("시작=").append(startDate.toLocalDate()).append(", ");
+                if (endDate != null) replyBuilder.append("종료=").append(endDate.toLocalDate());
+                
+                response.setReply(replyBuilder.toString());
+                break;
+            case "Get_Anomaly_Statistics":
+                String statsDate = parameters.getFieldsOrDefault("date", Value.newBuilder().setStringValue("").build()).getStringValue();
+                String statsDatePeriod = parameters.getFieldsOrDefault("date-period", Value.newBuilder().setStringValue("").build()).getStringValue();
+                String statsAnomalyType = parameters.getFieldsOrDefault("anomaly_type", Value.newBuilder().setStringValue("").build()).getStringValue();
+
+                LocalDateTime statsStartDate = null;
+                LocalDateTime statsEndDate = null;
+
+                if (!statsDate.isEmpty()) {
+                    try {
+                        statsStartDate = LocalDate.parse(statsDate).atStartOfDay();
+                        statsEndDate = LocalDate.parse(statsDate).plusDays(1).atStartOfDay();
+                    } catch (DateTimeParseException e) {
+                        // Handle parsing error
+                    }
+                } else if (!statsDatePeriod.isEmpty()) {
+                    String[] dates = statsDatePeriod.split("/");
+                    if (dates.length == 2) {
+                        try {
+                            statsStartDate = LocalDate.parse(dates[0]).atStartOfDay();
+                            statsEndDate = LocalDate.parse(dates[1]).plusDays(1).atStartOfDay();
+                        } catch (DateTimeParseException e) {
+                            // Handle parsing error
+                        }
+                    }
+                }
+
+                // Call AnomalyBehaviorService to get actual statistics
+                Map<String, Long> stats = anomalyBehaviorService.getAnomalyStatistics(currentUserId, statsAnomalyType, statsStartDate, statsEndDate);
+
+                StringBuilder statsReplyBuilder = new StringBuilder();
+                statsReplyBuilder.append("📊 이상 행동 통계 결과:\n\n");
+                statsReplyBuilder.append("• 총 이상 행동 건수: ").append(stats.get("total")).append("건\n\n");
+                
+                if (!statsAnomalyType.isEmpty()) {
+                    statsReplyBuilder.append("• 검색 유형: ").append(statsAnomalyType).append("\n\n");
+                }
+                if (statsStartDate != null) {
+                    statsReplyBuilder.append("• 기간: ").append(statsStartDate.toLocalDate());
+                    if (statsEndDate != null) {
+                        statsReplyBuilder.append(" ~ ").append(statsEndDate.toLocalDate());
+                    }
+                    statsReplyBuilder.append("\n\n");
+                }
+                
+                if (stats.get("total") == 0) {
+                    statsReplyBuilder.append("\n해당 조건에 맞는 이상 행동이 없습니다.");
+                } else {
+                    statsReplyBuilder.append("\n상세 정보는 이상 행동 목록에서 확인하실 수 있습니다.");
+                }
+                
+                response.setReply(statsReplyBuilder.toString());
+                break;
+            case "Get_Anomaly_Trends":
+                String trendsDatePeriod = parameters.getFieldsOrDefault("date-period", Value.newBuilder().setStringValue("").build()).getStringValue();
+                String trendsAnomalyType = parameters.getFieldsOrDefault("anomaly_type", Value.newBuilder().setStringValue("").build()).getStringValue();
+
+                LocalDateTime trendsStartDate = null;
+                LocalDateTime trendsEndDate = null;
+
+                if (!trendsDatePeriod.isEmpty()) {
+                    String[] dates = trendsDatePeriod.split("/");
+                    if (dates.length == 2) {
+                        try {
+                            trendsStartDate = LocalDate.parse(dates[0]).atStartOfDay();
+                            trendsEndDate = LocalDate.parse(dates[1]).plusDays(1).atStartOfDay();
+                        } catch (DateTimeParseException e) {
+                            log.error("날짜 파싱 오류: {}", trendsDatePeriod, e);
+                        }
+                    }
+                } else {
+                    // 기본값: 최근 7일
+                    trendsEndDate = LocalDateTime.now();
+                    trendsStartDate = trendsEndDate.minusDays(7);
+                }
+
+                if (trendsStartDate != null && trendsEndDate != null) {
+                    // 트렌드 분석 수행
+                    AnomalyTrendResponse trendResponse = anomalyBehaviorService.getAnomalyTrends(
+                        currentUserId, trendsAnomalyType, trendsStartDate, trendsEndDate);
+
+                    StringBuilder trendsReplyBuilder = new StringBuilder();
+                    trendsReplyBuilder.append("📈 이상 행동 트렌드 분석 결과\n\n");
+                    trendsReplyBuilder.append("📅 분석 기간: ").append(trendResponse.getAnalysisPeriod()).append("\n\n");
+                    trendsReplyBuilder.append("📊 총 이상 행동 건수: ").append(trendResponse.getTotalCount()).append("건\n\n");
+
+                    if (trendResponse.getTotalCount() > 0) {
+                        // 유형별 통계
+                        trendsReplyBuilder.append("🔍 유형별 통계:\n\n");
+                        trendResponse.getTypeStatistics().forEach((type, count) -> {
+                            String typeName = getAnomalyTypeName(type);
+                            trendsReplyBuilder.append("• ").append(typeName).append(": ").append(count).append("건\n\n");
+                        });
+
+                        // 시간대별 통계 (상위 3개)
+                        trendsReplyBuilder.append("⏰ 시간대별 통계 (상위 3개):\n\n");
+                        trendResponse.getHourlyStatistics().entrySet().stream()
+                            .sorted(Map.Entry.<Integer, Long>comparingByValue().reversed())
+                            .limit(3)
+                            .forEach(entry -> {
+                                trendsReplyBuilder.append("• ").append(entry.getKey()).append("시: ").append(entry.getValue()).append("건\n");
+                            });
+
+                        // CCTV별 통계 (상위 3개)
+                        if (!trendResponse.getCctvStatistics().isEmpty()) {
+                            trendsReplyBuilder.append("\n📹 CCTV별 통계 (상위 3개):\n");
+                            trendResponse.getCctvStatistics().entrySet().stream()
+                                .sorted(Map.Entry.<String, Long>comparingByValue().reversed())
+                                .limit(3)
+                                .forEach(entry -> {
+                                    trendsReplyBuilder.append("• ").append(entry.getKey()).append(": ").append(entry.getValue()).append("건\n");
+                                });
+                        }
+
+                        // 트렌드 분석
+                        trendsReplyBuilder.append("\n\n").append(trendResponse.getTrendAnalysis());
+
+                        // 주요 인사이트 출력 제거
+
+                        // 위험도 평가/권장사항 제거 요청에 따라 출력하지 않음
+                    } else {
+                        trendsReplyBuilder.append("분석 기간 동안 이상 행동이 발생하지 않았습니다.\n");
+                        trendsReplyBuilder.append("상태가 양호합니다! 🎉");
+                    }
+
+                    response.setReply(trendsReplyBuilder.toString());
+                } else {
+                    response.setReply("날짜 형식이 올바르지 않습니다. 'YYYY-MM-DD/YYYY-MM-DD' 형식으로 입력해주세요.");
+                }
+                break;
+            case "Get_CCTV_List":
+                CctvListResponse cctvListResponse = cctvService.getCctvListForChatbot(currentUserId);
+                
+                StringBuilder cctvListBuilder = new StringBuilder();
+                cctvListBuilder.append("📹 CCTV 목록\n\n");
+                cctvListBuilder.append("총 ").append(cctvListResponse.getTotalCount()).append("대의 CCTV가 등록되어 있습니다:\n\n");
+                
+                if (cctvListResponse.getCctvList().isEmpty()) {
+                    cctvListBuilder.append("등록된 CCTV가 없습니다. 새 CCTV를 추가해보세요!");
+                } else {
+                    for (CctvListResponse.CctvInfo cctv : cctvListResponse.getCctvList()) {
+                        cctvListBuilder.append("• ").append(cctv.getCctvName())
+                                .append(" (").append(cctv.getIpAddress()).append(")")
+                                .append(" - ").append(cctv.getStatus())
+                                .append("\n\n");
+                    }
+                }
+                
+                response.setReply(cctvListBuilder.toString());
+                break;
+            case "Get_Storage_Info":
+                StorageInfoResponse storageInfo = storageSpaceService.getStorageInfoForChatbot(currentUserId);
+                
+                StringBuilder storageBuilder = new StringBuilder();
+                storageBuilder.append("💾 저장 공간 정보\n\n");
+                storageBuilder.append("• 총 용량: ").append(formatBytes(storageInfo.getTotalSpace())).append("\n\n");
+                storageBuilder.append("• 사용량: ").append(formatBytes(storageInfo.getUsedSpace())).append("\n\n");
+                storageBuilder.append("• 사용 가능: ").append(formatBytes(storageInfo.getAvailableSpace())).append("\n\n");
+                storageBuilder.append("• 사용률: ").append(String.format("%.1f", storageInfo.getUsagePercentage())).append("%\n\n");
+                storageBuilder.append("• 상태: ").append(storageInfo.getUsageStatus()).append("\n\n");
+                storageBuilder.append(storageInfo.getWarningMessage());
+                
+                response.setReply(storageBuilder.toString());
+                break;
+            case "Get_Dashboard_Summary":
+                String dashboardDate = parameters.getFieldsOrDefault("date", Value.newBuilder().setStringValue("").build()).getStringValue();
+                LocalDate summaryDate = null;
+                
+                if (!dashboardDate.isEmpty()) {
+                    try {
+                        summaryDate = LocalDate.parse(dashboardDate);
+                    } catch (DateTimeParseException e) {
+                        log.error("날짜 파싱 오류: {}", dashboardDate, e);
+                    }
+                }
+                
+                DashboardSummaryResponse dashboardSummary = dashboardService.getDashboardSummaryForChatbot(currentUserId, summaryDate);
+                
+                StringBuilder dashboardBuilder = new StringBuilder();
+                dashboardBuilder.append("📊 ").append(dashboardSummary.getSummaryMessage()).append("\n\n");
+                dashboardBuilder.append("• 시스템 상태: ").append(dashboardSummary.getSystemStatus()).append("\n\n");
+                dashboardBuilder.append("• 활성 CCTV: ").append(dashboardSummary.getActiveCctvCount()).append("/").append(dashboardSummary.getTotalCctvCount()).append("대\n\n");
+                dashboardBuilder.append("• 저장 공간 사용률: ").append(String.format("%.1f", dashboardSummary.getStorageUsagePercentage())).append("%\n\n");
+                dashboardBuilder.append(dashboardSummary.getMainAlert());
+                
+                response.setReply(dashboardBuilder.toString());
+                break;
+            case "Get_Recent_Videos":
+                String videoDate = parameters.getFieldsOrDefault("date", Value.newBuilder().setStringValue("").build()).getStringValue();
+                String videoCctvName = parameters.getFieldsOrDefault("cctv_name", Value.newBuilder().setStringValue("").build()).getStringValue();
+                
+                LocalDateTime videoStartDate = null;
+                LocalDateTime videoEndDate = LocalDateTime.now();
+                
+                if (!videoDate.isEmpty()) {
+                    try {
+                        videoStartDate = LocalDate.parse(videoDate).atStartOfDay();
+                        videoEndDate = videoStartDate.plusDays(1);
+                    } catch (DateTimeParseException e) {
+                        log.error("날짜 파싱 오류: {}", videoDate, e);
+                    }
+                } else {
+                    videoStartDate = videoEndDate.minusDays(7); // 기본값: 최근 7일
+                }
+                
+                RecentVideosResponse recentVideos = videoService.getRecentVideosForChatbot(currentUserId, videoStartDate, videoEndDate, 10);
+                
+                StringBuilder videosBuilder = new StringBuilder();
+                videosBuilder.append("🎥 최근 녹화 영상\n\n");
+                videosBuilder.append("총 ").append(recentVideos.getTotalCount()).append("개의 영상을 찾았습니다:\n\n");
+                
+                if (recentVideos.getVideoList().isEmpty()) {
+                    videosBuilder.append("해당 기간에 녹화된 영상이 없습니다.");
+                } else {
+                    for (RecentVideosResponse.VideoInfo video : recentVideos.getVideoList()) {
+                        videosBuilder.append("• ").append(video.getCctvName())
+                                .append(" - ").append(video.getAnomalyTime().toLocalDate())
+                                .append(" ").append(video.getAnomalyTime().toLocalTime().toString().substring(0, 5))
+                                .append(" (").append(video.getDuration()).append("초)")
+                                .append(" - ").append(video.getStatus())
+                                .append("\n\n");
+                    }
+                }
+                
+                response.setReply(videosBuilder.toString());
+                break;
+            case "Get_CCTV_Status":
+                String statusCctvName = parameters.getFieldsOrDefault("cctv_name", Value.newBuilder().setStringValue("").build()).getStringValue();
+                
+                if (statusCctvName.isEmpty()) {
+                    response.setReply("CCTV 이름을 입력해주세요. 예: '현관 CCTV 상태 어때?'");
+                } else {
+                    String cctvStatus = cctvService.getCctvStatusForChatbot(currentUserId, statusCctvName);
+                    response.setReply(cctvStatus);
+                }
+                break;
+            case "Get_Anomaly_Details":
+                String anomalyIdStr = parameters.getFieldsOrDefault("anomaly_id", Value.newBuilder().setStringValue("").build()).getStringValue();
+                
+                if (anomalyIdStr.isEmpty()) {
+                    response.setReply("이상 행동 ID를 입력해주세요. 예: '이상 행동 ID 123 상세 정보'");
+                } else {
+                    try {
+                        Long anomalyId = Long.parseLong(anomalyIdStr);
+                        AnomalyBehavior anomaly = anomalyBehaviorService.getAnomalyBehaviorWithPresignedUrls(anomalyId);
+                        
+                        StringBuilder anomalyDetailsBuilder = new StringBuilder();
+                        anomalyDetailsBuilder.append("🔍 이상 행동 상세 정보\n\n");
+                        anomalyDetailsBuilder.append("• ID: ").append(anomaly.getAnomalyId()).append("\n\n");
+                        anomalyDetailsBuilder.append("• 유형: ").append(getAnomalyTypeName(anomaly.getAnomalyBehaviorType())).append("\n\n");
+                        anomalyDetailsBuilder.append("• 발생 시간: ").append(anomaly.getAnomalyTime()).append("\n\n");
+                        anomalyDetailsBuilder.append("• 비디오 링크: ").append(anomaly.getAnomalyVideoLink()).append("\n\n");
+                        anomalyDetailsBuilder.append("• 썸네일 링크: ").append(anomaly.getAnomalyThumbnailLink()).append("\n\n");
+                        
+                        response.setReply(anomalyDetailsBuilder.toString());
+                    } catch (NumberFormatException e) {
+                        response.setReply("올바른 이상 행동 ID를 입력해주세요.");
+                    } catch (Exception e) {
+                        response.setReply("이상 행동 정보를 찾을 수 없습니다.");
+                    }
+                }
+                break;
+            case "Get_User_Settings":
+                String userSettings = userService.getUserSettingsForChatbot(currentUserId);
+                response.setReply(userSettings);
+                break;
+            case "Update_Notification_Settings":
+                String notificationStatus = parameters.getFieldsOrDefault("notification_status", Value.newBuilder().setStringValue("").build()).getStringValue();
+                
+                if (notificationStatus.isEmpty()) {
+                    response.setReply("알림 설정을 입력해주세요. 예: '알림 끄고 싶어' 또는 '알림 켜줘'");
+                } else {
+                    boolean enableNotification = "켜기".equals(notificationStatus) || "on".equalsIgnoreCase(notificationStatus) || "활성화".equals(notificationStatus);
+                    String updateResult = userService.updateNotificationSettingsForChatbot(currentUserId, enableNotification);
+                    response.setReply(updateResult);
+                }
+                break;
+            case "Default_Fallback_Intent":
+                response.setReply(fulfillmentText);
+                break;
+            default:
+                response.setReply("죄송합니다. 이해하지 못했습니다. 다시 말씀해 주시겠어요?");
+                break;
+        }
+        log.info("챗봇 응답 생성 완료");
+        return response;
+        } catch (Exception e) {
+            log.error("챗봇 메시지 처리 중 오류 발생", e);
+            ChatbotResponse errorResponse = new ChatbotResponse();
+            errorResponse.setReply("죄송합니다. 처리 중 오류가 발생했습니다. 잠시 후 다시 시도해 주세요.");
+            return errorResponse;
+        }
+    }
+    
+    /**
+     * 이상 행동 유형 코드를 한국어 이름으로 변환
+     */
+    private String getAnomalyTypeName(String typeCode) {
+        switch (typeCode) {
+            case "TYPE1": return "전도";
+            case "TYPE2": return "파손";
+            case "TYPE3": return "방화";
+            case "TYPE4": return "흡연";
+            case "TYPE5": return "유기";
+            case "TYPE6": return "절도";
+            case "TYPE7": return "폭행";
+            default: return typeCode;
+        }
+    }
+    
+    /**
+     * 바이트를 읽기 쉬운 형식으로 변환
+     */
+    private String formatBytes(Long bytes) {
+        if (bytes == null || bytes == 0) return "0 B";
+        
+        String[] units = {"B", "KB", "MB", "GB", "TB"};
+        int unitIndex = 0;
+        double size = bytes.doubleValue();
+        
+        while (size >= 1024 && unitIndex < units.length - 1) {
+            size /= 1024;
+            unitIndex++;
+        }
+        
+        return String.format("%.1f %s", size, units[unitIndex]);
+    }
+}

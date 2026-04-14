@@ -1,0 +1,64 @@
+.termwrapper {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: flex-start;
+  width: 95%;
+  height: 100%;
+
+  &__menu {
+    display: inline-flex;
+    width: 100%;
+
+    &__button {
+      text-align: center;
+      width: 50%;
+      padding: 10px;
+      background-color: main.$color-background-box;
+
+      border: none;
+      border-radius: 10px 10px 0 0;
+
+      font-size: 1.2rem;
+      font-weight: 600;
+
+      &.active {
+        border-bottom: 2px solid main.$color-border-black;
+        color: main.$color-text-black;
+      }
+
+      &.inactive {
+        border-bottom: 2px solid main.$color-border-gray;
+        color: main.$color-text-gray;
+      }
+
+      &:hover {
+        filter: brightness(0.9);
+      }
+    }
+  }
+
+  &__text {
+    display: flex;
+    flex: 1;
+    flex-direction: column;
+    align-items: center;
+    justify-content: flex-start;
+    width: 100%;
+
+    font-size: 0.8rem;
+    color: main.$color-text-black;
+    gap: 20px;
+    margin-top: 20px;
+    padding: 10px 20px;
+
+    overflow: auto;
+    text-overflow: clip;
+
+    section {
+      width: 100%;
+      text-align: start;
+      line-height: 140%;
+    }
+  }
+}

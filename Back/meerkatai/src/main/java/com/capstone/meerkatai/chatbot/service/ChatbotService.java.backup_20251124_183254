@@ -1,0 +1,828 @@
+package com.capstone.meerkatai.chatbot.service;
+
+import com.google.cloud.dialogflow.v2.QueryResult;
+import com.capstone.meerkatai.chatbot.dto.ChatbotResponse;
+import org.springframework.stereotype.Service;
+import com.google.protobuf.Struct;
+import com.google.protobuf.Value;
+import com.capstone.meerkatai.anomalybehavior.service.AnomalyBehaviorService;
+import com.capstone.meerkatai.anomalybehavior.entity.AnomalyBehavior;
+import com.capstone.meerkatai.chatbot.dto.AnomalyTrendResponse;
+import com.capstone.meerkatai.chatbot.dto.CctvListResponse;
+import com.capstone.meerkatai.chatbot.dto.StorageInfoResponse;
+import com.capstone.meerkatai.chatbot.dto.DashboardSummaryResponse;
+import com.capstone.meerkatai.chatbot.dto.RecentVideosResponse;
+import com.capstone.meerkatai.cctv.service.CctvService;
+import com.capstone.meerkatai.cctv.entity.Cctv;
+import com.capstone.meerkatai.cctv.repository.CctvRepository;
+import com.capstone.meerkatai.storagespace.service.StorageSpaceService;
+import com.capstone.meerkatai.dashboard.service.DashboardService;
+import com.capstone.meerkatai.video.service.VideoService;
+import com.capstone.meerkatai.user.service.UserService;
+import com.capstone.meerkatai.user.entity.User;
+import com.capstone.meerkatai.user.repository.UserRepository;
+import org.springframework.security.core.Authentication;
+import org.springframework.security.core.context.SecurityContextHolder;
+import lombok.extern.slf4j.Slf4j;
+
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeParseException;
+import java.util.List;
+import java.util.Map;
+import java.util.stream.Collectors;
+
+@Slf4j
+@Service
+public class ChatbotService {
+
+    private static final float CONFIDENCE_THRESHOLD = 0.4f;
+
+    private final DialogflowService dialogflowService;
+    private final AnomalyBehaviorService anomalyBehaviorService;
+    private final CctvService cctvService;
+    private final CctvRepository cctvRepository;
+    private final StorageSpaceService storageSpaceService;
+    private final DashboardService dashboardService;
+    private final VideoService videoService;
+    private final UserService userService;
+    private final UserRepository userRepository;
+
+    public ChatbotService(DialogflowService dialogflowService,
+                          AnomalyBehaviorService anomalyBehaviorService,
+                          CctvService cctvService,
+                          CctvRepository cctvRepository,
+                          StorageSpaceService storageSpaceService,
+                          DashboardService dashboardService,
+                          VideoService videoService,
+                          UserService userService,
+                          UserRepository userRepository) {
+        this.dialogflowService = dialogflowService;
+        this.anomalyBehaviorService = anomalyBehaviorService;
+        this.cctvService = cctvService;
+        this.cctvRepository = cctvRepository;
+        this.storageSpaceService = storageSpaceService;
+        this.dashboardService = dashboardService;
+        this.videoService = videoService;
+        this.userService = userService;
+        this.userRepository = userRepository;
+    }
+
+    public ChatbotResponse processMessage(String message) {
+        try {
+            log.info("챗봇 메시지 처리 시작: {}", message);
+            
+            QueryResult queryResult = dialogflowService.detectIntent(message);
+            String intentDisplayName = queryResult.getIntent().getDisplayName();
+            String fulfillmentText = queryResult.getFulfillmentText();
+            Struct parameters = queryResult.getParameters();
+            float intentConfidence = queryResult.getIntentDetectionConfidence();
+
+            log.info("Dialogflow Intent 감지: {} (신뢰도: {}) - {}", intentDisplayName, intentConfidence, fulfillmentText);
+            
+            if (intentConfidence < CONFIDENCE_THRESHOLD && 
+                !intentDisplayName.equals("Default_Welcome_Intent") && 
+                !intentDisplayName.equals("Default_Fallback_Intent") &&
+                !intentDisplayName.equals("Search_Anomaly_Events") &&
+                !intentDisplayName.equals("Get_Storage_Info") &&
+                !intentDisplayName.equals("Get_CCTV_List") &&
+                !intentDisplayName.equals("Get_Anomaly_Statistics")) {
+                log.warn("Intent 신뢰도 낮음: {} ({}), 임계값: {}", intentDisplayName, intentConfidence, CONFIDENCE_THRESHOLD);
+                ChatbotResponse lowConfidenceResponse = new ChatbotResponse();
+                lowConfidenceResponse.setReply("질문을 정확히 이해하지 못했습니다. 다시 한 번 말씀해 주시겠어요?\n예: '오늘 이상 행동 검색해줘', 'CCTV 목록 보여줘'");
+                return lowConfidenceResponse;
+            }
+
+            Long currentUserId = getCurrentUserId();
+            
+            ChatbotResponse response = new ChatbotResponse();
+
+            switch (intentDisplayName) {
+                case "Default_Welcome_Intent":
+                    response.setReply(fulfillmentText);
+                    break;
+                case "Search_Anomaly_Events":
+                    return handleSearchAnomalyEvents(parameters, currentUserId);
+                case "Get_Anomaly_Trends":
+                    return handleGetAnomalyTrends(parameters, currentUserId);
+                case "Get_CCTV_List":
+                    return handleGetCctvList(currentUserId);
+                case "Get_Storage_Info":
+                    return handleGetStorageInfo(currentUserId);
+                case "Get_Dashboard_Summary":
+                    return handleGetDashboardSummary(parameters, currentUserId);
+                case "Get_Recent_Videos":
+                    return handleGetRecentVideos(parameters, currentUserId);
+                case "Get_CCTV_Status":
+                    return handleGetCctvStatus(parameters, currentUserId);
+                case "Get_Anomaly_Details":
+                    return handleGetAnomalyDetails(parameters, currentUserId);
+                case "Get_User_Settings":
+                    return handleGetUserSettings(currentUserId);
+                case "Update_Notification_Settings":
+                    return handleUpdateNotificationSettings(parameters, currentUserId);
+                case "Default_Fallback_Intent":
+                    response.setReply(fulfillmentText);
+                    break;
+                default:
+                    response.setReply("죄송합니다. 이해하지 못했습니다. 다시 말씀해 주시겠어요?");
+                    break;
+            }
+            
+            log.info("챗봇 응답 생성 완료");
+            return response;
+        } catch (Exception e) {
+            log.error("챗봇 메시지 처리 중 오류 발생", e);
+            ChatbotResponse errorResponse = new ChatbotResponse();
+            errorResponse.setReply("죄송합니다. 처리 중 오류가 발생했습니다. 잠시 후 다시 시도해 주세요.");
+            return errorResponse;
+        }
+    }
+
+    private Long getCurrentUserId() {
+        Authentication authentication = SecurityContextHolder.getContext().getAuthentication();
+        String email = authentication.getName();
+        
+        User currentUser = userRepository.findByEmail(email)
+                .orElseThrow(() -> new RuntimeException("사용자를 찾을 수 없습니다: " + email));
+        Long currentUserId = currentUser.getUserId();
+        
+        log.info("사용자 인증 완료: userId={}, email={}", currentUserId, email);
+        return currentUserId;
+    }
+
+    private ChatbotResponse handleSearchAnomalyEvents(Struct parameters, Long userId) {
+        log.info("수신된 모든 파라미터: {}", parameters.getFieldsMap());
+        
+        String cctvNameInput = parameters.getFieldsOrDefault("cctv_name", Value.newBuilder().setStringValue("").build()).getStringValue();
+        if (cctvNameInput.isEmpty()) {
+            cctvNameInput = parameters.getFieldsOrDefault("cctvName", Value.newBuilder().setStringValue("").build()).getStringValue();
+        }
+        
+        String anomalyTypeInput = parameters.getFieldsOrDefault("anomaly_type", Value.newBuilder().setStringValue("").build()).getStringValue();
+        if (anomalyTypeInput.isEmpty()) {
+            anomalyTypeInput = parameters.getFieldsOrDefault("anomalyType", Value.newBuilder().setStringValue("").build()).getStringValue();
+        }
+        
+        String date = parameters.getFieldsOrDefault("date", Value.newBuilder().setStringValue("").build()).getStringValue();
+        String datePeriod = parameters.getFieldsOrDefault("date-period", Value.newBuilder().setStringValue("").build()).getStringValue();
+
+        log.info("이상 행동 검색 파라미터(원본) - cctvNameInput: {}, anomalyTypeInput: {}, date: {}, datePeriod: {}", 
+                 cctvNameInput, anomalyTypeInput, date, datePeriod);
+        
+        String cctvName = "";
+        if (!cctvNameInput.isEmpty()) {
+            Cctv matchedCctv = findBestMatchingCctv(cctvNameInput, userId);
+            if (matchedCctv != null) {
+                cctvName = matchedCctv.getCctvName();
+                log.info("CCTV 매칭 성공: 입력='{}' → 매칭='{}'", cctvNameInput, cctvName);
+            } else {
+                log.warn("CCTV 매칭 실패: 입력='{}' (임계값 미달 또는 CCTV 없음)", cctvNameInput);
+            }
+        }
+        
+        String anomalyType = anomalyTypeInput;
+
+        log.info("이상 행동 검색 파라미터(최종) - cctvName: {}, anomalyType: {}, date: {}, datePeriod: {}", 
+                 cctvName, anomalyType, date, datePeriod);
+
+        LocalDateTime startDate = null;
+        LocalDateTime endDate = null;
+
+        if (parameters.containsFields("date-time")) {
+            Value dateTimeValue = parameters.getFieldsOrThrow("date-time");
+            Struct dateTimeStruct = null;
+            
+            if (dateTimeValue.hasListValue() && dateTimeValue.getListValue().getValuesCount() > 0) {
+                Value firstValue = dateTimeValue.getListValue().getValues(0);
+                if (firstValue.hasStructValue()) {
+                    dateTimeStruct = firstValue.getStructValue();
+                }
+            } else if (dateTimeValue.hasStructValue()) {
+                dateTimeStruct = dateTimeValue.getStructValue();
+            }
+            
+            if (dateTimeStruct != null) {
+                String startDateStr = dateTimeStruct.getFieldsOrDefault("startDate", Value.newBuilder().setStringValue("").build()).getStringValue();
+                String endDateStr = dateTimeStruct.getFieldsOrDefault("endDate", Value.newBuilder().setStringValue("").build()).getStringValue();
+                
+                log.info("date-time 파라미터 파싱: startDate={}, endDate={}", startDateStr, endDateStr);
+                
+                if (!startDateStr.isEmpty() && !endDateStr.isEmpty()) {
+                    startDate = parseDialogflowDateTime(startDateStr);
+                    endDate = parseDialogflowDateTime(endDateStr);
+                    
+                    if (startDate != null && endDate != null) {
+                        endDate = endDate.withHour(23).withMinute(59).withSecond(59);
+                    }
+                }
+            }
+        } else if (!date.isEmpty()) {
+            LocalDateTime[] dateRange = parseSingleDate(date);
+            if (dateRange != null) {
+                if (!isValidDateRange(dateRange[0], dateRange[1])) {
+                    return createErrorResponse("날짜 범위가 유효하지 않습니다. 시작일은 종료일보다 이전이어야 합니다.");
+                }
+                startDate = dateRange[0];
+                endDate = dateRange[1];
+            }
+        } else if (!datePeriod.isEmpty()) {
+            LocalDateTime[] dateRange = parseDatePeriod(datePeriod);
+            if (dateRange != null) {
+                if (!isValidDateRange(dateRange[0], dateRange[1])) {
+                    return createErrorResponse("날짜 범위가 유효하지 않습니다. 시작일은 종료일보다 이전이어야 합니다.");
+                }
+                startDate = dateRange[0];
+                endDate = dateRange[1];
+            }
+        }
+        
+        if (startDate == null || endDate == null) {
+            log.info("날짜 파라미터 누락 - 최근 7일로 기본값 설정");
+            endDate = LocalDateTime.now();
+            startDate = endDate.minusDays(7);
+        }
+
+        List<AnomalyBehavior> events = anomalyBehaviorService.searchAnomalyEvents(userId, cctvName, anomalyType, startDate, endDate);
+
+        StringBuilder replyBuilder = new StringBuilder();
+        if (events.isEmpty()) {
+            replyBuilder.append("검색 조건에 맞는 이상 행동이 없습니다. ");
+        } else {
+            replyBuilder.append("총 ").append(events.size()).append("건의 이상 행동을 찾았습니다:\n\n");
+            
+            for (int i = 0; i < Math.min(events.size(), 5); i++) {
+                AnomalyBehavior event = events.get(i);
+                replyBuilder.append("• ").append(event.getAnomalyBehaviorType())
+                        .append(" - ").append(event.getAnomalyTime().toLocalDate())
+                        .append(" ");
+                if (event.getAnomalyTime() != null && event.getAnomalyTime().toLocalTime() != null) {
+                    String timeStr = event.getAnomalyTime().toLocalTime().toString();
+                    if (timeStr.length() >= 5) {
+                        replyBuilder.append(timeStr.substring(0, 5));
+                    }
+                }
+                
+                if (event.getStreamingVideo() != null && event.getStreamingVideo().getCctv() != null) {
+                    replyBuilder.append(" (").append(event.getStreamingVideo().getCctv().getCctvName()).append(")");
+                }
+                replyBuilder.append("\n\n");
+            }
+            
+            if (events.size() > 5) {
+                replyBuilder.append("\n\n... 외 ").append(events.size() - 5).append("건 더 있습니다.");
+            }
+        }
+        
+        replyBuilder.append("\n\n검색 조건: ");
+        if (!cctvName.isEmpty()) replyBuilder.append("CCTV=").append(cctvName).append(", ");
+        if (!anomalyType.isEmpty()) replyBuilder.append("유형=").append(anomalyType).append(", ");
+        if (startDate != null) replyBuilder.append("시작=").append(startDate.toLocalDate()).append(", ");
+        if (endDate != null) replyBuilder.append("종료=").append(endDate.toLocalDate());
+        
+        ChatbotResponse response = new ChatbotResponse();
+        response.setReply(replyBuilder.toString());
+        return response;
+    }
+
+    private ChatbotResponse handleGetAnomalyTrends(Struct parameters, Long userId) {
+        log.info("수신된 모든 파라미터: {}", parameters.getFieldsMap());
+        
+        String date = parameters.getFieldsOrDefault("date", Value.newBuilder().setStringValue("").build()).getStringValue();
+        String datePeriod = parameters.getFieldsOrDefault("date-period", Value.newBuilder().setStringValue("").build()).getStringValue();
+        String anomalyType = parameters.getFieldsOrDefault("anomalyType", Value.newBuilder().setStringValue("").build()).getStringValue();
+
+        log.info("이상 행동 통계/트렌드 파라미터 - anomalyType: {}, date: {}, datePeriod: {}", 
+                 anomalyType, date, datePeriod);
+
+        LocalDateTime trendsStartDate = null;
+        LocalDateTime trendsEndDate = null;
+
+        if (parameters.containsFields("date-time")) {
+            Value dateTimeValue = parameters.getFieldsOrThrow("date-time");
+            Struct dateTimeStruct = null;
+            
+            if (dateTimeValue.hasListValue() && dateTimeValue.getListValue().getValuesCount() > 0) {
+                Value firstValue = dateTimeValue.getListValue().getValues(0);
+                if (firstValue.hasStructValue()) {
+                    dateTimeStruct = firstValue.getStructValue();
+                }
+            } else if (dateTimeValue.hasStructValue()) {
+                dateTimeStruct = dateTimeValue.getStructValue();
+            }
+            
+            if (dateTimeStruct != null) {
+                String startDateStr = dateTimeStruct.getFieldsOrDefault("startDate", Value.newBuilder().setStringValue("").build()).getStringValue();
+                String endDateStr = dateTimeStruct.getFieldsOrDefault("endDate", Value.newBuilder().setStringValue("").build()).getStringValue();
+                
+                log.info("date-time 파라미터 파싱: startDate={}, endDate={}", startDateStr, endDateStr);
+                
+                if (!startDateStr.isEmpty() && !endDateStr.isEmpty()) {
+                    trendsStartDate = parseDialogflowDateTime(startDateStr);
+                    trendsEndDate = parseDialogflowDateTime(endDateStr);
+                    
+                    if (trendsStartDate != null && trendsEndDate != null) {
+                        trendsEndDate = trendsEndDate.withHour(23).withMinute(59).withSecond(59);
+                    }
+                }
+            }
+        } else if (!date.isEmpty()) {
+            LocalDateTime[] dateRange = parseSingleDate(date);
+            if (dateRange != null) {
+                if (!isValidDateRange(dateRange[0], dateRange[1])) {
+                    return createErrorResponse("날짜 범위가 유효하지 않습니다. 시작일은 종료일보다 이전이어야 합니다.");
+                }
+                trendsStartDate = dateRange[0];
+                trendsEndDate = dateRange[1];
+            }
+        } else if (!datePeriod.isEmpty()) {
+            LocalDateTime[] dateRange = parseDatePeriod(datePeriod);
+            if (dateRange != null) {
+                if (!isValidDateRange(dateRange[0], dateRange[1])) {
+                    return createErrorResponse("날짜 범위가 유효하지 않습니다. 시작일은 종료일보다 이전이어야 합니다.");
+                }
+                trendsStartDate = dateRange[0];
+                trendsEndDate = dateRange[1];
+            }
+        }
+        
+        if (trendsStartDate == null || trendsEndDate == null) {
+            log.info("날짜 파라미터 누락 - 최근 7일로 기본값 설정");
+            trendsEndDate = LocalDateTime.now();
+            trendsStartDate = trendsEndDate.minusDays(7);
+        }
+
+        if (trendsStartDate != null && trendsEndDate != null) {
+            AnomalyTrendResponse trendResponse = anomalyBehaviorService.getAnomalyTrends(
+                userId, anomalyType, trendsStartDate, trendsEndDate);
+
+            StringBuilder trendsReplyBuilder = new StringBuilder();
+            trendsReplyBuilder.append("📈 이상 행동 트렌드 분석 결과\n\n");
+            trendsReplyBuilder.append("📅 분석 기간: ").append(trendResponse.getAnalysisPeriod()).append("\n\n");
+            trendsReplyBuilder.append("📊 총 이상 행동 건수: ").append(trendResponse.getTotalCount()).append("건\n\n");
+
+            if (trendResponse.getTotalCount() > 0) {
+                trendsReplyBuilder.append("🔍 유형별 통계:\n\n");
+                trendResponse.getTypeStatistics().forEach((type, count) -> {
+                    String typeName = getAnomalyTypeName(type);
+                    trendsReplyBuilder.append("• ").append(typeName).append(": ").append(count).append("건\n\n");
+                });
+
+                trendsReplyBuilder.append("⏰ 시간대별 통계 (상위 3개):\n\n");
+                trendResponse.getHourlyStatistics().entrySet().stream()
+                    .sorted(Map.Entry.<Integer, Long>comparingByValue().reversed())
+                    .limit(3)
+                    .forEach(entry -> {
+                        trendsReplyBuilder.append("• ").append(entry.getKey()).append("시: ").append(entry.getValue()).append("건\n");
+                    });
+
+                if (!trendResponse.getCctvStatistics().isEmpty()) {
+                    trendsReplyBuilder.append("\n📹 CCTV별 통계 (상위 3개):\n");
+                    trendResponse.getCctvStatistics().entrySet().stream()
+                        .sorted(Map.Entry.<String, Long>comparingByValue().reversed())
+                        .limit(3)
+                        .forEach(entry -> {
+                            trendsReplyBuilder.append("• ").append(entry.getKey()).append(": ").append(entry.getValue()).append("건\n");
+                        });
+                }
+
+                trendsReplyBuilder.append("\n\n").append(trendResponse.getTrendAnalysis());
+            } else {
+                trendsReplyBuilder.append("분석 기간 동안 이상 행동이 발생하지 않았습니다.\n");
+                trendsReplyBuilder.append("상태가 양호합니다! 🎉");
+            }
+
+            ChatbotResponse response = new ChatbotResponse();
+            response.setReply(trendsReplyBuilder.toString());
+            return response;
+        } else {
+            return createErrorResponse("날짜 형식이 올바르지 않습니다. 'YYYY-MM-DD/YYYY-MM-DD' 형식으로 입력해주세요.");
+        }
+    }
+
+    private ChatbotResponse handleGetCctvList(Long userId) {
+        CctvListResponse cctvListResponse = cctvService.getCctvListForChatbot(userId);
+        
+        StringBuilder cctvListBuilder = new StringBuilder();
+        cctvListBuilder.append("📹 CCTV 목록\n\n");
+        cctvListBuilder.append("총 ").append(cctvListResponse.getTotalCount()).append("대의 CCTV가 등록되어 있습니다:\n\n");
+        
+        if (cctvListResponse.getCctvList().isEmpty()) {
+            cctvListBuilder.append("등록된 CCTV가 없습니다. 새 CCTV를 추가해보세요!");
+        } else {
+            for (CctvListResponse.CctvInfo cctv : cctvListResponse.getCctvList()) {
+                cctvListBuilder.append("• ").append(cctv.getCctvName())
+                        .append(" (").append(cctv.getIpAddress()).append(")")
+                        .append(" - ").append(cctv.getStatus())
+                        .append("\n\n");
+            }
+        }
+        
+        ChatbotResponse response = new ChatbotResponse();
+        response.setReply(cctvListBuilder.toString());
+        return response;
+    }
+
+    private ChatbotResponse handleGetStorageInfo(Long userId) {
+        StorageInfoResponse storageInfo = storageSpaceService.getStorageInfoForChatbot(userId);
+        
+        StringBuilder storageBuilder = new StringBuilder();
+        storageBuilder.append("💾 저장 공간 정보\n\n");
+        storageBuilder.append("• 총 용량: ").append(formatBytes(storageInfo.getTotalSpace())).append("\n\n");
+        storageBuilder.append("• 사용량: ").append(formatBytes(storageInfo.getUsedSpace())).append("\n\n");
+        storageBuilder.append("• 사용 가능: ").append(formatBytes(storageInfo.getAvailableSpace())).append("\n\n");
+        storageBuilder.append("• 사용률: ").append(String.format("%.1f", storageInfo.getUsagePercentage())).append("%\n\n");
+        storageBuilder.append("• 상태: ").append(storageInfo.getUsageStatus()).append("\n\n");
+        storageBuilder.append(storageInfo.getWarningMessage());
+        
+        ChatbotResponse response = new ChatbotResponse();
+        response.setReply(storageBuilder.toString());
+        return response;
+    }
+
+    private ChatbotResponse handleGetDashboardSummary(Struct parameters, Long userId) {
+        String dashboardDate = parameters.getFieldsOrDefault("date", Value.newBuilder().setStringValue("").build()).getStringValue();
+        LocalDate summaryDate = null;
+        
+        log.info("대시보드 요약 파라미터 - date: {}", dashboardDate);
+        
+        if (!dashboardDate.isEmpty()) {
+            try {
+                summaryDate = LocalDate.parse(dashboardDate);
+                if (!isValidDate(summaryDate)) {
+                    return createErrorResponse("날짜가 유효하지 않습니다. 미래 날짜는 조회할 수 없습니다.");
+                }
+            } catch (DateTimeParseException e) {
+                log.error("날짜 파싱 오류: {}", dashboardDate, e);
+            }
+        }
+        
+        DashboardSummaryResponse dashboardSummary = dashboardService.getDashboardSummaryForChatbot(userId, summaryDate);
+        
+        StringBuilder dashboardBuilder = new StringBuilder();
+        dashboardBuilder.append("📊 ").append(dashboardSummary.getSummaryMessage()).append("\n\n");
+        dashboardBuilder.append("• 시스템 상태: ").append(dashboardSummary.getSystemStatus()).append("\n\n");
+        dashboardBuilder.append("• 활성 CCTV: ").append(dashboardSummary.getActiveCctvCount()).append("/").append(dashboardSummary.getTotalCctvCount()).append("대\n\n");
+        dashboardBuilder.append("• 저장 공간 사용률: ").append(String.format("%.1f", dashboardSummary.getStorageUsagePercentage())).append("%\n\n");
+        dashboardBuilder.append(dashboardSummary.getMainAlert());
+        
+        ChatbotResponse response = new ChatbotResponse();
+        response.setReply(dashboardBuilder.toString());
+        return response;
+    }
+
+    private ChatbotResponse handleGetRecentVideos(Struct parameters, Long userId) {
+        String videoDate = parameters.getFieldsOrDefault("date", Value.newBuilder().setStringValue("").build()).getStringValue();
+        String videoCctvName = parameters.getFieldsOrDefault("cctvName", Value.newBuilder().setStringValue("").build()).getStringValue();
+        
+        log.info("최근 영상 조회 파라미터 - cctvName: {}, date: {}", videoCctvName, videoDate);
+        
+        LocalDateTime videoStartDate = null;
+        LocalDateTime videoEndDate = LocalDateTime.now();
+        
+        if (parameters.containsFields("date-time")) {
+            Value dateTimeValue = parameters.getFieldsOrThrow("date-time");
+            Struct dateTimeStruct = null;
+            
+            if (dateTimeValue.hasListValue() && dateTimeValue.getListValue().getValuesCount() > 0) {
+                Value firstValue = dateTimeValue.getListValue().getValues(0);
+                if (firstValue.hasStructValue()) {
+                    dateTimeStruct = firstValue.getStructValue();
+                }
+            } else if (dateTimeValue.hasStructValue()) {
+                dateTimeStruct = dateTimeValue.getStructValue();
+            }
+            
+            if (dateTimeStruct != null) {
+                String startDateStr = dateTimeStruct.getFieldsOrDefault("startDate", Value.newBuilder().setStringValue("").build()).getStringValue();
+                String endDateStr = dateTimeStruct.getFieldsOrDefault("endDate", Value.newBuilder().setStringValue("").build()).getStringValue();
+                
+                log.info("date-time 파라미터 파싱: startDate={}, endDate={}", startDateStr, endDateStr);
+                
+                if (!startDateStr.isEmpty() && !endDateStr.isEmpty()) {
+                    videoStartDate = parseDialogflowDateTime(startDateStr);
+                    videoEndDate = parseDialogflowDateTime(endDateStr);
+                    
+                    if (videoStartDate != null && videoEndDate != null) {
+                        videoEndDate = videoEndDate.withHour(23).withMinute(59).withSecond(59);
+                    }
+                }
+            }
+        } else if (!videoDate.isEmpty()) {
+            LocalDateTime[] dateRange = parseSingleDate(videoDate);
+            if (dateRange != null) {
+                if (!isValidDateRange(dateRange[0], dateRange[1])) {
+                    return createErrorResponse("날짜 범위가 유효하지 않습니다. 시작일은 종료일보다 이전이어야 합니다.");
+                }
+                videoStartDate = dateRange[0];
+                videoEndDate = dateRange[1];
+            }
+        }
+        
+        if (videoStartDate == null || videoEndDate == null) {
+            videoEndDate = LocalDateTime.now();
+            videoStartDate = videoEndDate.minusDays(7);
+        }
+        
+        RecentVideosResponse recentVideos = videoService.getRecentVideosForChatbot(userId, videoStartDate, videoEndDate, 10);
+        
+        StringBuilder videosBuilder = new StringBuilder();
+        videosBuilder.append("🎥 최근 녹화 영상\n\n");
+        videosBuilder.append("총 ").append(recentVideos.getTotalCount()).append("개의 영상을 찾았습니다:\n\n");
+        
+        if (recentVideos.getVideoList().isEmpty()) {
+            videosBuilder.append("해당 기간에 녹화된 영상이 없습니다.");
+        } else {
+            for (RecentVideosResponse.VideoInfo video : recentVideos.getVideoList()) {
+                videosBuilder.append("• ").append(video.getCctvName())
+                        .append(" - ");
+                if (video.getAnomalyTime() != null) {
+                    videosBuilder.append(video.getAnomalyTime().toLocalDate()).append(" ");
+                    if (video.getAnomalyTime().toLocalTime() != null) {
+                        String timeStr = video.getAnomalyTime().toLocalTime().toString();
+                        if (timeStr.length() >= 5) {
+                            videosBuilder.append(timeStr.substring(0, 5));
+                        }
+                    }
+                }
+                videosBuilder.append(" (").append(video.getDuration()).append("초)")
+                        .append(" - ").append(video.getStatus())
+                        .append("\n\n");
+            }
+        }
+        
+        ChatbotResponse response = new ChatbotResponse();
+        response.setReply(videosBuilder.toString());
+        return response;
+    }
+
+    private ChatbotResponse handleGetCctvStatus(Struct parameters, Long userId) {
+        String statusCctvName = parameters.getFieldsOrDefault("cctvName", Value.newBuilder().setStringValue("").build()).getStringValue();
+        
+        log.info("CCTV 상태 조회 파라미터 - cctvName: {}", statusCctvName);
+        
+        ChatbotResponse response = new ChatbotResponse();
+        if (statusCctvName.isEmpty()) {
+            response.setReply("CCTV 이름을 입력해주세요. 예: '현관 CCTV 상태 어때?'");
+        } else {
+            String cctvStatus = cctvService.getCctvStatusForChatbot(userId, statusCctvName);
+            response.setReply(cctvStatus);
+        }
+        return response;
+    }
+
+    private ChatbotResponse handleGetAnomalyDetails(Struct parameters, Long userId) {
+        String anomalyIdStr = parameters.getFieldsOrDefault("anomalyId", Value.newBuilder().setStringValue("").build()).getStringValue();
+        
+        ChatbotResponse response = new ChatbotResponse();
+        if (anomalyIdStr.isEmpty()) {
+            response.setReply("이상 행동 ID를 입력해주세요. 예: '이상 행동 ID 123 상세 정보'");
+        } else {
+            try {
+                Long anomalyId = Long.parseLong(anomalyIdStr);
+                AnomalyBehavior anomaly = anomalyBehaviorService.getAnomalyBehaviorWithPresignedUrls(anomalyId);
+                
+                StringBuilder anomalyDetailsBuilder = new StringBuilder();
+                anomalyDetailsBuilder.append("🔍 이상 행동 상세 정보\n\n");
+                anomalyDetailsBuilder.append("• ID: ").append(anomaly.getAnomalyId()).append("\n\n");
+                anomalyDetailsBuilder.append("• 유형: ").append(getAnomalyTypeName(anomaly.getAnomalyBehaviorType())).append("\n\n");
+                anomalyDetailsBuilder.append("• 발생 시간: ").append(anomaly.getAnomalyTime()).append("\n\n");
+                anomalyDetailsBuilder.append("• 비디오 링크: ").append(anomaly.getAnomalyVideoLink()).append("\n\n");
+                anomalyDetailsBuilder.append("• 썸네일 링크: ").append(anomaly.getAnomalyThumbnailLink()).append("\n\n");
+                
+                response.setReply(anomalyDetailsBuilder.toString());
+            } catch (NumberFormatException e) {
+                response.setReply("올바른 이상 행동 ID를 입력해주세요.");
+            } catch (Exception e) {
+                response.setReply("이상 행동 정보를 찾을 수 없습니다.");
+            }
+        }
+        return response;
+    }
+
+    private ChatbotResponse handleGetUserSettings(Long userId) {
+        String userSettings = userService.getUserSettingsForChatbot(userId);
+        ChatbotResponse response = new ChatbotResponse();
+        response.setReply(userSettings);
+        return response;
+    }
+
+    private ChatbotResponse handleUpdateNotificationSettings(Struct parameters, Long userId) {
+        String notificationStatus = parameters.getFieldsOrDefault("notificationStatus", Value.newBuilder().setStringValue("").build()).getStringValue();
+        
+        log.info("알림 설정 업데이트 파라미터 - notificationStatus: {}", notificationStatus);
+        
+        ChatbotResponse response = new ChatbotResponse();
+        if (notificationStatus.isEmpty()) {
+            response.setReply("알림 설정을 입력해주세요. 예: '알림 끄고 싶어' 또는 '알림 켜줘'");
+        } else {
+            boolean enableNotification = "켜기".equals(notificationStatus) || "on".equalsIgnoreCase(notificationStatus) || "활성화".equals(notificationStatus);
+            String updateResult = userService.updateNotificationSettingsForChatbot(userId, enableNotification);
+            response.setReply(updateResult);
+        }
+        return response;
+    }
+    
+    private LocalDateTime[] parseSingleDate(String dateStr) {
+        if (dateStr == null || dateStr.isEmpty()) {
+            return null;
+        }
+        try {
+            LocalDateTime startDate = LocalDate.parse(dateStr).atStartOfDay();
+            LocalDateTime endDate = startDate.plusDays(1);
+            return new LocalDateTime[]{startDate, endDate};
+        } catch (DateTimeParseException e) {
+            log.error("날짜 파싱 오류: {}", dateStr, e);
+            return null;
+        }
+    }
+
+    private LocalDateTime[] parseDatePeriod(String datePeriod) {
+        if (datePeriod == null || datePeriod.isEmpty()) {
+            return null;
+        }
+        String[] dates = datePeriod.split("/");
+        if (dates.length != 2) {
+            log.error("잘못된 date-period 형식: {}", datePeriod);
+            return null;
+        }
+        try {
+            LocalDateTime startDate = LocalDate.parse(dates[0]).atStartOfDay();
+            LocalDateTime endDate = LocalDate.parse(dates[1]).plusDays(1).atStartOfDay();
+            return new LocalDateTime[]{startDate, endDate};
+        } catch (DateTimeParseException e) {
+            log.error("날짜 파싱 오류: {}", datePeriod, e);
+            return null;
+        }
+    }
+
+    private LocalDateTime parseDialogflowDateTime(String dateTimeStr) {
+        if (dateTimeStr == null || dateTimeStr.isEmpty()) {
+            return null;
+        }
+        try {
+            LocalDateTime parsedDateTime = LocalDateTime.parse(dateTimeStr.substring(0, 19));
+            
+            if (parsedDateTime.getYear() > LocalDateTime.now().getYear()) {
+                parsedDateTime = parsedDateTime.minusYears(1);
+                log.info("미래 연도 감지 - 1년 차감: {} → {}", dateTimeStr, parsedDateTime);
+            }
+            
+            return parsedDateTime;
+        } catch (Exception e) {
+            log.error("Dialogflow DateTime 파싱 오류: {}", dateTimeStr, e);
+            return null;
+        }
+    }
+
+    private int calculateLevenshteinDistance(String s1, String s2) {
+        int[][] dp = new int[s1.length() + 1][s2.length() + 1];
+        
+        for (int i = 0; i <= s1.length(); i++) {
+            dp[i][0] = i;
+        }
+        for (int j = 0; j <= s2.length(); j++) {
+            dp[0][j] = j;
+        }
+        
+        for (int i = 1; i <= s1.length(); i++) {
+            for (int j = 1; j <= s2.length(); j++) {
+                int cost = (s1.charAt(i - 1) == s2.charAt(j - 1)) ? 0 : 1;
+                dp[i][j] = Math.min(
+                    Math.min(dp[i - 1][j] + 1, dp[i][j - 1] + 1),
+                    dp[i - 1][j - 1] + cost
+                );
+            }
+        }
+        
+        return dp[s1.length()][s2.length()];
+    }
+    
+    private double calculateLevenshteinSimilarity(String s1, String s2) {
+        if (s1 == null || s2 == null || s1.isEmpty() || s2.isEmpty()) {
+            return 0.0;
+        }
+        int distance = calculateLevenshteinDistance(s1, s2);
+        int maxLen = Math.max(s1.length(), s2.length());
+        return 1.0 - ((double) distance / maxLen);
+    }
+    
+    private Cctv findBestMatchingCctv(String userInput, Long userId) {
+        if (userInput == null || userInput.trim().isEmpty()) {
+            return null;
+        }
+        
+        List<Cctv> likeResults = cctvRepository.findByUser_UserIdAndCctvNameContaining(userId, userInput);
+        List<Cctv> allCctvs = cctvRepository.findByUser_UserId(userId);
+        
+        if (allCctvs.isEmpty()) {
+            return null;
+        }
+        
+        class CctvScore {
+            Cctv cctv;
+            double score;
+            
+            CctvScore(Cctv cctv, double score) {
+                this.cctv = cctv;
+                this.score = score;
+            }
+        }
+        
+        List<CctvScore> scoredCctvs = new java.util.ArrayList<>();
+        
+        for (Cctv cctv : allCctvs) {
+            double levenshteinSimilarity = calculateLevenshteinSimilarity(userInput, cctv.getCctvName());
+            boolean likeMatch = likeResults.contains(cctv);
+            
+            double finalScore = levenshteinSimilarity + (likeMatch ? 0.3 : 0.0);
+            
+            scoredCctvs.add(new CctvScore(cctv, finalScore));
+            log.info("CCTV 매칭 점수: {} | Levenshtein={:.2f}, LIKE={}, 최종={:.2f}", 
+                     cctv.getCctvName(), levenshteinSimilarity, likeMatch, finalScore);
+        }
+        
+        scoredCctvs.sort((a, b) -> Double.compare(b.score, a.score));
+        
+        CctvScore bestMatch = scoredCctvs.get(0);
+        
+        final double SIMILARITY_THRESHOLD = 0.5;
+        if (bestMatch.score < SIMILARITY_THRESHOLD) {
+            log.warn("최고 점수 CCTV도 임계값 미달: {} (점수: {:.2f}, 임계값: {:.2f})", 
+                     bestMatch.cctv.getCctvName(), bestMatch.score, SIMILARITY_THRESHOLD);
+            return null;
+        }
+        
+        log.info("최종 선택된 CCTV: {} (점수: {:.2f})", bestMatch.cctv.getCctvName(), bestMatch.score);
+        return bestMatch.cctv;
+    }
+
+    private boolean isValidDateRange(LocalDateTime startDate, LocalDateTime endDate) {
+        if (startDate == null || endDate == null) {
+            return true;
+        }
+        if (startDate.isAfter(endDate)) {
+            log.warn("날짜 범위 검증 실패: 시작일({})이 종료일({})보다 늦습니다.", startDate, endDate);
+            return false;
+        }
+        LocalDateTime now = LocalDateTime.now();
+        if (startDate.isAfter(now)) {
+            log.warn("날짜 범위 검증 실패: 시작일({})이 현재 시간({})보다 늦습니다.", startDate, now);
+            return false;
+        }
+        return true;
+    }
+
+    private boolean isValidDate(LocalDate date) {
+        if (date == null) {
+            return true;
+        }
+        if (date.isAfter(LocalDate.now())) {
+            log.warn("날짜 검증 실패: 날짜({})가 오늘({})보다 늦습니다.", date, LocalDate.now());
+            return false;
+        }
+        return true;
+    }
+
+    private ChatbotResponse createErrorResponse(String message) {
+        ChatbotResponse response = new ChatbotResponse();
+        response.setReply(message);
+        return response;
+    }
+
+    private String formatTime(LocalDateTime dateTime) {
+        if (dateTime == null || dateTime.toLocalTime() == null) {
+            return "";
+        }
+        String timeStr = dateTime.toLocalTime().toString();
+        return timeStr.length() >= 5 ? timeStr.substring(0, 5) : timeStr;
+    }
+
+    private String getAnomalyTypeName(String typeCode) {
+        switch (typeCode) {
+            case "TYPE1": return "전도";
+            case "TYPE2": return "파손";
+            case "TYPE3": return "방화";
+            case "TYPE4": return "흡연";
+            case "TYPE5": return "유기";
+            case "TYPE6": return "절도";
+            case "TYPE7": return "폭행";
+            default: return typeCode;
+        }
+    }
+    
+    private String formatBytes(Long bytes) {
+        if (bytes == null || bytes == 0) return "0 B";
+        
+        String[] units = {"B", "KB", "MB", "GB", "TB"};
+        int unitIndex = 0;
+        double size = bytes.doubleValue();
+        
+        while (size >= 1024 && unitIndex < units.length - 1) {
+            size /= 1024;
+            unitIndex++;
+        }
+        
+        return String.format("%.1f %s", size, units[unitIndex]);
+    }
+}

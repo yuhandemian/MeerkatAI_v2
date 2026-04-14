@@ -1,0 +1,178 @@
+.cctvpage {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  position: relative;
+
+  width: 100%;
+  min-width: 850px;
+  height: 100%;
+  min-height: 700px;
+  padding: 20px;
+
+  &__wrapper {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: flex-start;
+    width: 100%;
+    max-width: 1920px;
+    height: 100%;
+    border-radius: 20px;
+
+    box-shadow: 0px 2px 8px rgba(0, 0, 0, 0.08);
+    background-color: main.$color-background-box;
+
+    &__title {
+      width: 100%;
+      padding: 18px 24px;
+      font-size: 1.6rem;
+      font-weight: 700;
+      border-bottom: 1px solid main.$color-border-gray;
+    }
+
+    &__content {
+      display: flex;
+      flex-direction: column;
+      align-items: flex-start;
+      justify-content: center;
+      position: relative;
+      width: 100%;
+      padding: 0 24px;
+
+      &__subtitle {
+        width: 100%;
+        padding: 18px 18px;
+        font-size: 1rem;
+        font-weight: 600;
+
+        border-bottom: 1px solid main.$color-border-black;
+      }
+
+      &__buttons {
+        display: flex;
+        align-items: center;
+        justify-content: flex-end;
+        gap: 10px;
+        width: 100%;
+        padding: 20px 15px;
+      }
+
+      &__table {
+        display: block;
+        flex-direction: column;
+        align-items: flex-start;
+        justify-content: flex-start;
+      }
+
+      &__inner {
+        display: flex;
+        flex-direction: column;
+        align-items: flex-start;
+        justify-content: flex-start;
+        width: 550px;
+        padding: 25px 20px;
+        gap: 30px;
+
+        font-size: 0.8rem;
+
+        .row {
+          display: flex;
+          align-items: center;
+          justify-content: flex-start;
+          width: 100%;
+
+          height: 13px;
+          gap: 60px;
+
+          label {
+            width: 120px;
+            height: 13px;
+            border-right: 1px solid main.$color-border-gray;
+          }
+
+          .input {
+            flex: 1;
+            font-size: 0.8rem;
+            padding: 4px 8px;
+            border-radius: 5px;
+            border: 1px solid main.$color-border-gray;
+          }
+
+          .gray {
+            color: main.$color-text-gray;
+          }
+        }
+      }
+    }
+  }
+}
+
+.activatebtn {
+  padding: 6px 12px;
+  border-radius: 20px;
+  font-size: 0.85rem;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  border: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 120px;
+
+  &.active {
+    background-color: #4caf50;
+    color: white;
+    box-shadow: 0 2px 4px rgba(76, 175, 80, 0.3);
+
+    &:hover {
+      filter: brightness(0.9);
+    }
+
+    &::before {
+      content: "•";
+      display: inline-block;
+      margin-right: 6px;
+      font-size: 0.8rem;
+      animation: pulse 1.5s infinite;
+    }
+  }
+
+  &.inactive {
+    background-color: #e0e0e0;
+    color: #757575;
+
+    &:hover {
+      background-color: #d0d0d0;
+      color: #616161;
+    }
+  }
+}
+
+@keyframes pulse {
+  0% {
+    opacity: 0.6;
+  }
+  50% {
+    opacity: 1;
+  }
+  100% {
+    opacity: 0.6;
+  }
+}
+
+.loader {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  z-index: 4;
+  /* 오버플로우 방지 */
+  overflow: hidden;
+}

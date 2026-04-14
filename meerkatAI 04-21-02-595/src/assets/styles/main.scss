@@ -1,0 +1,14 @@
+@use "./color";
+@use "./font";
+@forward "./color";
+@forward "./color";
+
+* {
+  padding: 0;
+  margin: 0;
+
+  box-sizing: border-box;
+  font-family: "Pretendard, sans-serif";
+  font-weight: 400;
+  font-size: 20px;
+}

@@ -1,0 +1,535 @@
+package com.capstone.meerkatai.anomalybehavior.service;
+
+import com.capstone.meerkatai.alarm.dto.AnomalyVideoMetadataRequest;
+import com.capstone.meerkatai.anomalybehavior.entity.AnomalyBehavior;
+import com.capstone.meerkatai.anomalybehavior.repository.AnomalyBehaviorRepository;
+import com.capstone.meerkatai.chatbot.dto.AnomalyTrendResponse;
+import com.capstone.meerkatai.cctv.entity.Cctv;
+import com.capstone.meerkatai.cctv.repository.CctvRepository;
+import com.capstone.meerkatai.global.service.S3Service;
+import com.capstone.meerkatai.streamingvideo.entity.StreamingVideo;
+import com.capstone.meerkatai.streamingvideo.repository.StreamingVideoRepository;
+import com.capstone.meerkatai.user.entity.User;
+import com.capstone.meerkatai.user.repository.UserRepository;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.net.URL;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+import java.util.*;
+import java.util.stream.Collectors;
+
+@Slf4j
+@Service
+@RequiredArgsConstructor
+public class AnomalyBehaviorService {
+
+    private final AnomalyBehaviorRepository anomalyBehaviorRepository;
+    private final UserRepository userRepository;
+    private final StreamingVideoRepository streamingVideoRepository;
+    private final CctvRepository cctvRepository;
+    private final S3Service s3Service;
+
+    //FastAPI에서 받은 메타데이터 DB에 저장하는 메소드
+    @Transactional
+    public AnomalyBehavior saveAnomalyBehavior(AnomalyVideoMetadataRequest request) {
+        log.info("이상행동 저장 시작: 사용자ID={}, CCTVID={}", request.getUserId(), request.getCctvId());
+        
+        // 사용자 조회
+        User user = userRepository.findById(request.getUserId())
+                .orElseThrow(() -> new RuntimeException("사용자 없음: ID=" + request.getUserId()));
+        log.debug("사용자 조회 성공: {}", user.getUserId());
+
+        // StreamingVideo 조회 - CCTV ID로 조회 시도
+        StreamingVideo streamingVideo;
+        try {
+            // 1. 사용자ID와 CCTVID로 먼저 조회 시도
+            Optional<StreamingVideo> streamingVideoOpt = streamingVideoRepository
+                    .findByUserUserIdAndCctvCctvId(request.getUserId(), request.getCctvId());
+            
+            if (streamingVideoOpt.isPresent()) {
+                streamingVideo = streamingVideoOpt.get();
+                log.info("사용자ID와 CCTVID로 StreamingVideo 조회 성공: id={}", streamingVideo.getStreamingVideoId());
+            } else {
+                // 2. CCTV ID로만 조회 시도
+                List<StreamingVideo> streamingVideos = streamingVideoRepository.findByCctvCctvId(request.getCctvId());
+                
+                if (!streamingVideos.isEmpty()) {
+                    streamingVideo = streamingVideos.get(0); // 가장 첫 번째 항목 사용
+                    log.info("CCTVID로 StreamingVideo 조회 성공: id={}", streamingVideo.getStreamingVideoId());
+                } else {
+                    // 3. 조회 실패 시 새로 생성
+                    log.warn("StreamingVideo를 찾을 수 없어 새로 생성합니다: cctvId={}", request.getCctvId());
+                    
+                    // CCTV 엔티티 조회
+                    Cctv cctv = cctvRepository.findById(request.getCctvId())
+                            .orElseThrow(() -> new RuntimeException("CCTV를 찾을 수 없습니다: ID=" + request.getCctvId()));
+                    
+                    // StreamingVideo 생성
+                    streamingVideo = StreamingVideo.builder()
+                            .user(user)
+                            .cctv(cctv)
+                            .startTime(LocalDateTime.now())
+                            .streamingVideoStatus(false)
+                            .streamingUrl("rtsp://placeholder") // 임시 URL
+                            .build();
+                    
+                    streamingVideo = streamingVideoRepository.save(streamingVideo);
+                    log.info("새 StreamingVideo 생성 완료: id={}", streamingVideo.getStreamingVideoId());
+                }
+            }
+        } catch (Exception e) {
+            log.error("StreamingVideo 처리 중 오류 발생", e);
+            throw new RuntimeException("StreamingVideo 처리 오류: " + e.getMessage(), e);
+        }
+
+        // S3 URL 확인 및 처리
+        String videoUrl = request.getVideoUrl();
+        String thumbnailUrl = request.getThumbnailUrl();
+        
+        // S3 URL 검증
+        if (videoUrl != null && !s3Service.isS3Url(videoUrl)) {
+            log.warn("비디오 URL이 S3 URL 형식이 아닙니다: {}", videoUrl);
+        }
+        
+        // 썸네일 URL 처리
+        if (thumbnailUrl == null || thumbnailUrl.trim().isEmpty()) {
+            if (videoUrl != null && !videoUrl.trim().isEmpty()) {
+                // 비디오 URL에서 썸네일 URL 생성
+                thumbnailUrl = s3Service.generateThumbnailUrlFromVideoUrl(videoUrl);
+                log.info("비디오 URL에서 썸네일 URL 생성: {}", thumbnailUrl);
+            }
+        }
+
+        // AnomalyBehavior 생성 및 저장
+        try {
+            AnomalyBehavior behavior = AnomalyBehavior.builder()
+                    .anomalyBehaviorType(request.getAnomalyType())
+                    .anomalyTime(request.getTimestamp())
+                    .anomalyVideoLink(videoUrl)
+                    .anomalyThumbnailLink(thumbnailUrl)
+                    .streamingVideo(streamingVideo)
+                    .user(user)
+                    .build();
+
+            AnomalyBehavior saved = anomalyBehaviorRepository.save(behavior);
+            log.info("✅ 이상행동 저장 완료: anomaly_id={}", saved.getAnomalyId());
+            return saved;
+        } catch (Exception e) {
+            log.error("이상행동 저장 중 오류 발생", e);
+            throw new RuntimeException("이상행동 저장 오류: " + e.getMessage(), e);
+        }
+    }
+    
+    /**
+     * 사용자의 모든 이상행동 목록 조회 (S3 URL을 presigned URL로 변환)
+     */
+    public List<AnomalyBehavior> getAllAnomalyBehaviorsWithPresignedUrls(Long userId) {
+        // 사용자의 이상행동 목록 조회 (JPA 메소드명 패턴에 맞게 수정)
+        List<AnomalyBehavior> anomalyBehaviors = anomalyBehaviorRepository.findByUserUserId(userId);
+        
+        // URL을 presigned URL로 변환하여 반환
+        return anomalyBehaviors.stream()
+                .map(behavior -> {
+                    // S3 URL을 presigned URL로 변환
+                    String videoLink = generatePresignedUrlIfNeeded(behavior.getAnomalyVideoLink());
+                    String thumbnailLink = generatePresignedUrlIfNeeded(behavior.getAnomalyThumbnailLink());
+                    
+                    // 객체의 URL을 presigned URL로 변경
+                    behavior.setAnomalyVideoLink(videoLink);
+                    behavior.setAnomalyThumbnailLink(thumbnailLink);
+                    return behavior;
+                })
+                .collect(Collectors.toList());
+    }
+    
+    /**
+     * 이상행동 상세 정보 조회 (S3 URL을 presigned URL로 변환)
+     */
+    public AnomalyBehavior getAnomalyBehaviorWithPresignedUrls(Long anomalyId) {
+        AnomalyBehavior behavior = anomalyBehaviorRepository.findById(anomalyId)
+                .orElseThrow(() -> new RuntimeException("이상행동 정보를 찾을 수 없습니다: ID=" + anomalyId));
+        
+        // S3 URL을 presigned URL로 변환
+        String videoLink = generatePresignedUrlIfNeeded(behavior.getAnomalyVideoLink());
+        String thumbnailLink = generatePresignedUrlIfNeeded(behavior.getAnomalyThumbnailLink());
+        
+        // 객체의 URL을 presigned URL로 변경
+        behavior.setAnomalyVideoLink(videoLink);
+        behavior.setAnomalyThumbnailLink(thumbnailLink);
+        
+        return behavior;
+    }
+
+    /**
+     * 이상 행동 이벤트를 검색합니다.
+     * @param userId 사용자 ID
+     * @param cctvName CCTV 이름 (선택 사항)
+     * @param anomalyType 이상 행동 유형 (선택 사항)
+     * @param startDate 시작 날짜 (선택 사항)
+     * @param endDate 종료 날짜 (선택 사항)
+     * @return 검색된 이상 행동 목록
+     */
+    public List<AnomalyBehavior> searchAnomalyEvents(Long userId, String cctvName, String anomalyType, LocalDateTime startDate, LocalDateTime endDate) {
+        // Start with all anomalies for the user
+        List<AnomalyBehavior> result = anomalyBehaviorRepository.findByUserUserId(userId);
+
+        // Filter by anomalyType if provided
+        if (anomalyType != null && !anomalyType.isEmpty()) {
+            result = result.stream()
+                    .filter(ab -> ab.getAnomalyBehaviorType().equalsIgnoreCase(anomalyType))
+                    .collect(Collectors.toList());
+        }
+
+        // Filter by cctvName if provided
+        if (cctvName != null && !cctvName.isEmpty()) {
+            result = result.stream()
+                    .filter(ab -> ab.getStreamingVideo() != null && ab.getStreamingVideo().getCctv() != null && ab.getStreamingVideo().getCctv().getCctvName().equalsIgnoreCase(cctvName))
+                    .collect(Collectors.toList());
+        }
+
+        // Filter by date range if provided
+        if (startDate != null && endDate != null) {
+            result = result.stream()
+                    .filter(ab -> ab.getAnomalyTime().isAfter(startDate) && ab.getAnomalyTime().isBefore(endDate))
+                    .collect(Collectors.toList());
+        }
+        
+        // Convert S3 URLs to presigned URLs before returning
+        return result.stream()
+                .map(behavior -> {
+                    String videoLink = generatePresignedUrlIfNeeded(behavior.getAnomalyVideoLink());
+                    String thumbnailLink = generatePresignedUrlIfNeeded(behavior.getAnomalyThumbnailLink());
+                    
+                    behavior.setAnomalyVideoLink(videoLink);
+                    behavior.setAnomalyThumbnailLink(thumbnailLink);
+                    return behavior;
+                })
+                .collect(Collectors.toList());
+    }
+
+    /**
+     * 점포명 패턴으로 여러 CCTV의 이상 행동을 검색합니다.
+     * @param userId 사용자 ID
+     * @param storePattern 점포명 패턴 (예: "성수점")
+     * @param anomalyType 이상 행동 유형 (선택 사항)
+     * @param startDate 시작 날짜
+     * @param endDate 종료 날짜
+     * @return 해당 점포의 모든 CCTV에서 발생한 이상 행동 목록
+     */
+    public List<AnomalyBehavior> searchAnomalyEventsByStore(Long userId, String storePattern, String anomalyType, LocalDateTime startDate, LocalDateTime endDate) {
+        log.info("점포 기반 이상 행동 검색: userId={}, storePattern={}, type={}", userId, storePattern, anomalyType);
+        
+        // Start with all anomalies for the user
+        List<AnomalyBehavior> result = anomalyBehaviorRepository.findByUserUserId(userId);
+
+        // Filter by store pattern (CCTV names containing the store pattern)
+        if (storePattern != null && !storePattern.isEmpty()) {
+            result = result.stream()
+                    .filter(ab -> ab.getStreamingVideo() != null 
+                            && ab.getStreamingVideo().getCctv() != null 
+                            && ab.getStreamingVideo().getCctv().getCctvName().contains(storePattern))
+                    .collect(Collectors.toList());
+            log.info("점포 패턴 '{}' 필터링 후: {}건", storePattern, result.size());
+        }
+
+        // Filter by anomalyType if provided
+        if (anomalyType != null && !anomalyType.isEmpty()) {
+            result = result.stream()
+                    .filter(ab -> ab.getAnomalyBehaviorType().equalsIgnoreCase(anomalyType))
+                    .collect(Collectors.toList());
+        }
+
+        // Filter by date range if provided
+        if (startDate != null && endDate != null) {
+            result = result.stream()
+                    .filter(ab -> ab.getAnomalyTime().isAfter(startDate) && ab.getAnomalyTime().isBefore(endDate))
+                    .collect(Collectors.toList());
+        }
+        
+        // Convert S3 URLs to presigned URLs before returning
+        return result.stream()
+                .map(behavior -> {
+                    String videoLink = generatePresignedUrlIfNeeded(behavior.getAnomalyVideoLink());
+                    String thumbnailLink = generatePresignedUrlIfNeeded(behavior.getAnomalyThumbnailLink());
+                    
+                    behavior.setAnomalyVideoLink(videoLink);
+                    behavior.setAnomalyThumbnailLink(thumbnailLink);
+                    return behavior;
+                })
+                .collect(Collectors.toList());
+    }
+    
+    public Map<String, Long> getAnomalyStatistics(Long userId, String anomalyType, LocalDateTime startDate, LocalDateTime endDate) {
+        List<AnomalyBehavior> allAnomalies = anomalyBehaviorRepository.findByUserUserId(userId);
+        
+        long count = allAnomalies.stream()
+                .filter(ab -> anomalyType == null || anomalyType.isEmpty() || ab.getAnomalyBehaviorType().equalsIgnoreCase(anomalyType))
+                .filter(ab -> startDate == null || ab.getAnomalyTime().isAfter(startDate))
+                .filter(ab -> endDate == null || ab.getAnomalyTime().isBefore(endDate))
+                .count();
+
+        return Map.of("total", count);
+    }
+    
+    /**
+     * S3 URL인 경우 Presigned URL로 변환, 아닌 경우 원래 URL 반환
+     */
+    private String generatePresignedUrlIfNeeded(String url) {
+        if (url == null || url.isEmpty()) {
+            return url;
+        }
+        
+        try {
+            if (s3Service.isS3Url(url)) {
+                String objectKey = s3Service.extractS3Key(url);
+                if (objectKey != null) {
+                    URL presignedUrl = s3Service.generatePresignedUrlForDownload(objectKey);
+                    return presignedUrl.toString();
+                }
+            }
+        } catch (Exception e) {
+            log.warn("Presigned URL 생성 실패, 원본 URL 사용: {}", e.getMessage());
+        }
+        
+        return url;
+    }
+    
+    /**
+     * 이상 행동 트렌드 분석을 수행합니다.
+     * @param userId 사용자 ID
+     * @param anomalyType 이상 행동 유형 (선택 사항)
+     * @param startDate 시작 날짜
+     * @param endDate 종료 날짜
+     * @return 트렌드 분석 결과
+     */
+    public AnomalyTrendResponse getAnomalyTrends(Long userId, String anomalyType, LocalDateTime startDate, LocalDateTime endDate) {
+        log.info("이상 행동 트렌드 분석 시작: userId={}, type={}, period={} ~ {}", userId, anomalyType, startDate, endDate);
+        
+        // 기본 데이터 조회
+        Long totalCount = anomalyBehaviorRepository.getTotalCountByUserAndTimeRange(userId, startDate, endDate);
+        List<Object[]> typeStats = anomalyBehaviorRepository.getAnomalyTypeStatistics(userId, startDate, endDate);
+        List<Object[]> hourlyStats = anomalyBehaviorRepository.getHourlyStatistics(userId, startDate, endDate);
+        List<Object[]> dailyStats = anomalyBehaviorRepository.getDailyStatistics(userId, startDate, endDate);
+        List<Object[]> cctvStats = anomalyBehaviorRepository.getCctvStatistics(userId, startDate, endDate);
+        
+        // 데이터 변환
+        Map<String, Long> typeStatistics = convertTypeStatistics(typeStats);
+        Map<Integer, Long> hourlyStatistics = convertHourlyStatistics(hourlyStats);
+        Map<String, Long> dailyStatistics = convertDailyStatistics(dailyStats);
+        Map<String, Long> cctvStatistics = convertCctvStatistics(cctvStats);
+        
+        // 트렌드 분석 및 인사이트 생성
+        String trendAnalysis = analyzeTrends(typeStatistics, hourlyStatistics, dailyStatistics, totalCount);
+        List<String> keyInsights = generateKeyInsights(typeStatistics, hourlyStatistics, dailyStatistics, cctvStatistics, totalCount);
+        String riskLevel = assessRiskLevel(totalCount, typeStatistics);
+        List<String> recommendations = generateRecommendations(typeStatistics, hourlyStatistics, cctvStatistics, riskLevel);
+        
+        // 분석 기간 문자열 생성
+        String analysisPeriod = formatAnalysisPeriod(startDate, endDate);
+        
+        return AnomalyTrendResponse.builder()
+                .analysisPeriod(analysisPeriod)
+                .totalCount(totalCount)
+                .typeStatistics(typeStatistics)
+                .hourlyStatistics(hourlyStatistics)
+                .dailyStatistics(dailyStatistics)
+                .cctvStatistics(cctvStatistics)
+                .trendAnalysis(trendAnalysis)
+                .keyInsights(keyInsights)
+                .riskLevel(riskLevel)
+                .recommendations(recommendations)
+                .build();
+    }
+    
+    /**
+     * 유형별 통계 데이터 변환
+     */
+    private Map<String, Long> convertTypeStatistics(List<Object[]> typeStats) {
+        Map<String, Long> result = new HashMap<>();
+        for (Object[] stat : typeStats) {
+            String type = (String) stat[0];
+            Long count = (Long) stat[1];
+            result.put(type, count);
+        }
+        return result;
+    }
+    
+    /**
+     * 시간대별 통계 데이터 변환
+     */
+    private Map<Integer, Long> convertHourlyStatistics(List<Object[]> hourlyStats) {
+        Map<Integer, Long> result = new HashMap<>();
+        for (Object[] stat : hourlyStats) {
+            Integer hour = (Integer) stat[0];
+            Long count = (Long) stat[1];
+            result.put(hour, count);
+        }
+        return result;
+    }
+    
+    /**
+     * 요일별 통계 데이터 변환
+     */
+    private Map<String, Long> convertDailyStatistics(List<Object[]> dailyStats) {
+        Map<String, Long> result = new HashMap<>();
+        String[] dayNames = {"일요일", "월요일", "화요일", "수요일", "목요일", "금요일", "토요일"};
+        
+        for (Object[] stat : dailyStats) {
+            Integer dayOfWeek = (Integer) stat[0];
+            Long count = (Long) stat[1];
+            String dayName = dayNames[dayOfWeek - 1]; // MySQL DAYOFWEEK는 1부터 시작
+            result.put(dayName, count);
+        }
+        return result;
+    }
+    
+    /**
+     * CCTV별 통계 데이터 변환
+     */
+    private Map<String, Long> convertCctvStatistics(List<Object[]> cctvStats) {
+        Map<String, Long> result = new HashMap<>();
+        for (Object[] stat : cctvStats) {
+            String cctvName = (String) stat[0];
+            Long count = (Long) stat[1];
+            result.put(cctvName, count);
+        }
+        return result;
+    }
+    
+    /**
+     * 트렌드 분석 수행
+     */
+    private String analyzeTrends(Map<String, Long> typeStats, Map<Integer, Long> hourlyStats, 
+                                Map<String, Long> dailyStats, Long totalCount) {
+        StringBuilder analysis = new StringBuilder();
+        
+        if (totalCount == 0) {
+            return "분석 기간 동안 이상 행동이 발생하지 않았습니다.";
+        }
+        
+        // 가장 빈번한 이상 행동 유형
+        String mostFrequentType = typeStats.entrySet().stream()
+                .max(Map.Entry.comparingByValue())
+                .map(Map.Entry::getKey)
+                .orElse("없음");
+        
+        // 가장 빈번한 시간대
+        Integer mostFrequentHour = hourlyStats.entrySet().stream()
+                .max(Map.Entry.comparingByValue())
+                .map(Map.Entry::getKey)
+                .orElse(0);
+        
+        // 가장 빈번한 요일
+        String mostFrequentDay = dailyStats.entrySet().stream()
+                .max(Map.Entry.comparingByValue())
+                .map(Map.Entry::getKey)
+                .orElse("없음");
+        
+        analysis.append("📊 트렌드 분석 결과:\n");
+        analysis.append("• 가장 빈번한 이상 행동: ").append(mostFrequentType).append("\n");
+        analysis.append("• 가장 빈번한 시간대: ").append(mostFrequentHour).append("시\n");
+        analysis.append("• 가장 빈번한 요일: ").append(mostFrequentDay).append("\n");
+        
+        return analysis.toString();
+    }
+    
+    /**
+     * 주요 인사이트 생성
+     */
+    private List<String> generateKeyInsights(Map<String, Long> typeStats, Map<Integer, Long> hourlyStats,
+                                           Map<String, Long> dailyStats, Map<String, Long> cctvStats, Long totalCount) {
+        List<String> insights = new ArrayList<>();
+        
+        if (totalCount == 0) {
+            insights.add("분석 기간 동안 이상 행동이 발생하지 않아 보안 상태가 양호합니다.");
+            return insights;
+        }
+        
+        // 유형별 인사이트
+        if (typeStats.containsKey("TYPE1") && typeStats.get("TYPE1") > totalCount * 0.3) {
+            insights.add("침입 시도가 전체 이상 행동의 30% 이상을 차지하여 보안 강화가 필요합니다.");
+        }
+        
+        // 시간대별 인사이트
+        long nightCount = hourlyStats.entrySet().stream()
+                .filter(entry -> entry.getKey() >= 22 || entry.getKey() <= 6)
+                .mapToLong(Map.Entry::getValue)
+                .sum();
+        
+        if (nightCount > totalCount * 0.4) {
+            insights.add("야간 시간대(22시~06시) 이상 행동이 40% 이상 발생하여 야간 보안 강화를 권장합니다.");
+        }
+        
+        // CCTV별 인사이트
+        if (!cctvStats.isEmpty()) {
+            String mostProblematicCctv = cctvStats.entrySet().stream()
+                    .max(Map.Entry.comparingByValue())
+                    .map(Map.Entry::getKey)
+                    .orElse("없음");
+            insights.add("'" + mostProblematicCctv + "' CCTV에서 가장 많은 이상 행동이 발생했습니다.");
+        }
+        
+        return insights;
+    }
+    
+    /**
+     * 위험도 평가
+     */
+    private String assessRiskLevel(Long totalCount, Map<String, Long> typeStats) {
+        if (totalCount == 0) {
+            return "낮음";
+        } else if (totalCount < 5) {
+            return "낮음";
+        } else if (totalCount < 15) {
+            return "보통";
+        } else if (totalCount < 30) {
+            return "높음";
+        } else {
+            return "매우 높음";
+        }
+    }
+    
+    /**
+     * 권장사항 생성
+     */
+    private List<String> generateRecommendations(Map<String, Long> typeStats, Map<Integer, Long> hourlyStats,
+                                                Map<String, Long> cctvStats, String riskLevel) {
+        List<String> recommendations = new ArrayList<>();
+        
+        if ("매우 높음".equals(riskLevel) || "높음".equals(riskLevel)) {
+            recommendations.add("보안 강화를 위해 추가 CCTV 설치를 고려하세요.");
+            recommendations.add("경비 서비스 도입을 검토하세요.");
+        }
+        
+        if (typeStats.containsKey("TYPE1") && typeStats.get("TYPE1") > 0) {
+            recommendations.add("침입 방지를 위해 출입 통제 시스템을 강화하세요.");
+        }
+        
+        if (typeStats.containsKey("TYPE2") && typeStats.get("TYPE2") > 0) {
+            recommendations.add("도난 방지를 위해 물리적 보안 장치를 점검하세요.");
+        }
+        
+        long nightCount = hourlyStats.entrySet().stream()
+                .filter(entry -> entry.getKey() >= 22 || entry.getKey() <= 6)
+                .mapToLong(Map.Entry::getValue)
+                .sum();
+        
+        if (nightCount > 0) {
+            recommendations.add("야간 보안을 위해 조명 시설을 점검하고 야간 순찰을 강화하세요.");
+        }
+        
+        return recommendations;
+    }
+    
+    /**
+     * 분석 기간 문자열 포맷팅
+     */
+    private String formatAnalysisPeriod(LocalDateTime startDate, LocalDateTime endDate) {
+        DateTimeFormatter formatter = DateTimeFormatter.ofPattern("yyyy-MM-dd");
+        return startDate.format(formatter) + " ~ " + endDate.format(formatter);
+    }
+}
